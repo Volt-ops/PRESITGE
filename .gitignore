@@ -1,0 +1,6 @@
+venv/
+.venv/
+.env
+temp_response.mp3
+__pycache__/
+*.pyc

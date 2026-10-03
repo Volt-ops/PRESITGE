@@ -1,0 +1,7 @@
+google-genai
+PyQt6
+pillow
+mss
+pyautogui
+python-dotenv
+edge-tts
