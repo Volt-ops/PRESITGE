@@ -27,25 +27,33 @@ from google.genai import types
 import edge_tts
 
 from PyQt6.QtCore import (
-    Qt, QThread, pyqtSignal, QTimer, QUrl, QRectF,
+    Qt, QThread, pyqtSignal, QTimer, QUrl, QRectF, QPointF, QSettings,
     QAbstractNativeEventFilter, QPropertyAnimation, QVariantAnimation, QEasingCurve,
 )
-from PyQt6.QtGui import QPainter, QColor, QLinearGradient
+from PyQt6.QtGui import QPainter, QColor, QLinearGradient, QPainterPath, QPalette, QFont, QPen, QBrush
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QLineEdit, QPushButton, QTextEdit, QFrame, QSizeGrip,
     QCheckBox, QLabel, QComboBox, QStackedWidget, QListWidget,
-    QGraphicsOpacityEffect,
+    QGraphicsOpacityEffect, QAbstractButton, QSlider, QScrollArea,
 )
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 
 # ----------------------------------------------------------------------------
 # Setup
 # ----------------------------------------------------------------------------
-load_dotenv()
+load_dotenv(override=True)   # the project's .env wins over stray system environment variables
 
+KEY_WARNING = ""
 try:
-    client = genai.Client()          # reads GEMINI_API_KEY / GOOGLE_API_KEY
+    _api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    if _api_key and not _api_key.startswith("AIza"):
+        KEY_WARNING = (
+            "This key doesn't look like a Gemini API key (they start with AIza).\n"
+            "Create one at aistudio.google.com/app/apikey and put it in .env as GEMINI_API_KEY."
+        )
+        print(f"[Init] {KEY_WARNING}")
+    client = genai.Client(api_key=_api_key)
 except Exception as e:
     client = None
     print(f"[Init] Gemini client unavailable: {e}")
@@ -434,54 +442,346 @@ class ShimmerBar(QWidget):
         x = (w + seg) * self._pos - seg
         grad = QLinearGradient(x, 0, x + seg, 0)
         grad.setColorAt(0.0, QColor(255, 255, 255, 0))
-        grad.setColorAt(0.5, QColor(255, 255, 255, 190))
+        grad.setColorAt(0.5, QColor(240, 205, 125, 230))
         grad.setColorAt(1.0, QColor(255, 255, 255, 0))
         p.setBrush(grad)
         p.drawRoundedRect(QRectF(0, 0, w, h), h / 2, h / 2)
 
 
 # ----------------------------------------------------------------------------
-# Styles
+# Design tokens: warm "champagne gold" accent on dark smoked glass
 # ----------------------------------------------------------------------------
-ICON_BTN = """
-    QPushButton {
-        background: rgba(255,255,255,0.08); color: rgba(255,255,255,0.85);
-        border: 1px solid rgba(255,255,255,0.15); border-radius: 13px;
-    }
-    QPushButton:hover { background: rgba(255,255,255,0.25); }
-    QPushButton:pressed { background: rgba(255,255,255,0.35); }
+GOLD_LIGHT = "#F3DB9B"
+GOLD = "#E2B659"
+GOLD_DEEP = "#B98A2E"
+GOLD_RGB = (226, 182, 89)
+FONT_STACK = "'Segoe UI Variable Display', 'Segoe UI', sans-serif"
+
+PANEL_QSS = f"""
+    QLabel {{ color: rgba(255,255,255,0.95); font-family: {FONT_STACK};
+              font-size: 13px; background: transparent; }}
+    QScrollBar:vertical {{ width: 8px; background: transparent; margin: 2px; }}
+    QScrollBar::handle:vertical {{ background: rgba(226,182,89,0.35);
+                                   border-radius: 3px; min-height: 28px; }}
+    QScrollBar::handle:vertical:hover {{ background: rgba(226,182,89,0.60); }}
+    QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+    QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: transparent; }}
+    QSlider::groove:horizontal {{ height: 4px; background: rgba(255,255,255,0.18); border-radius: 2px; }}
+    QSlider::sub-page:horizontal {{ background: {GOLD}; border-radius: 2px; }}
+    QSlider::handle:horizontal {{ background: #ffffff; width: 14px; height: 14px;
+                                  margin: -5px 0; border-radius: 4px; }}
+    QSlider::handle:horizontal:hover {{ background: {GOLD_LIGHT}; }}
 """
-MAIN_BTN = """
-    QPushButton {
-        background-color: rgba(255,255,255,0.16); color: #ffffff; font-weight: 600;
-        border-radius: 8px; padding: 8px 16px; border: 1px solid rgba(255,255,255,0.22);
-    }
-    QPushButton:hover { background-color: rgba(255,255,255,0.28); }
-    QPushButton:pressed { background-color: rgba(255,255,255,0.38); }
-    QPushButton:disabled { background-color: rgba(255,255,255,0.07); color: rgba(255,255,255,0.45); }
+
+SEND_BTN = f"""
+    QPushButton {{
+        background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 {GOLD_LIGHT}, stop:1 #C9983C);
+        color: #1B1408; border: none; border-radius: 10px;
+        font-family: {FONT_STACK}; font-size: 17px; font-weight: 800;
+    }}
+    QPushButton:hover {{
+        background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #FBE9B8, stop:1 #D9A94B);
+    }}
+    QPushButton:pressed {{ background: {GOLD_DEEP}; }}
+    QPushButton:disabled {{ background: rgba(255,255,255,0.12); color: rgba(255,255,255,0.35); }}
 """
-APPROVE_BTN = """
-    QPushButton {
-        background-color: rgba(80,200,120,0.35); color: #ffffff; font-weight: 600;
-        border-radius: 8px; padding: 6px 14px; border: 1px solid rgba(80,200,120,0.6);
-    }
-    QPushButton:hover { background-color: rgba(80,200,120,0.55); }
+APPROVE_BTN = f"""
+    QPushButton {{
+        background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 {GOLD_LIGHT}, stop:1 #C9983C);
+        color: #1B1408; font-family: {FONT_STACK}; font-size: 12px; font-weight: 700;
+        border: none; border-radius: 8px; padding: 0 18px;
+    }}
+    QPushButton:hover {{ background: #FBE9B8; }}
+    QPushButton:pressed {{ background: {GOLD_DEEP}; }}
 """
-CANCEL_BTN = """
-    QPushButton {
-        background-color: rgba(255,255,255,0.10); color: #ffffff;
-        border-radius: 8px; padding: 6px 14px; border: 1px solid rgba(255,255,255,0.2);
-    }
-    QPushButton:hover { background-color: rgba(255,90,90,0.40); }
+CANCEL_BTN = f"""
+    QPushButton {{
+        background: transparent; color: rgba(255,255,255,0.85); font-family: {FONT_STACK};
+        font-size: 12px; font-weight: 600; border: 1px solid rgba(255,255,255,0.20);
+        border-radius: 8px; padding: 0 18px;
+    }}
+    QPushButton:hover {{ background: rgba(255,255,255,0.10); }}
+    QPushButton:pressed {{ background: rgba(255,255,255,0.18); }}
 """
+BACK_BTN = f"""
+    QPushButton {{ color: {GOLD}; background: transparent; border: none;
+                   font-family: {FONT_STACK}; font-size: 13px; font-weight: 600;
+                   padding: 2px 0; text-align: left; }}
+    QPushButton:hover {{ color: {GOLD_LIGHT}; }}
+"""
+
+
+def _mix(a, b, t):
+    return QColor(*[int(a[i] + (b[i] - a[i]) * t) for i in range(4)])
+
+
+class GlassPanel(QFrame):
+    """Smoked-glass panel with adjustable opacity and a gold light-line along the top edge."""
+    RADIUS = 14
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._opacity = 0.66
+
+    def set_opacity(self, v):
+        self._opacity = max(0.3, min(1.0, float(v)))
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        path = QPainterPath()
+        path.addRoundedRect(r, self.RADIUS, self.RADIUS)
+
+        a = int(self._opacity * 255)
+        b = min(255, int(a * 1.12))
+        fill = QLinearGradient(0, 0, 0, self.height())
+        fill.setColorAt(0.0, QColor(40, 37, 46, a))
+        fill.setColorAt(1.0, QColor(18, 17, 23, b))
+        p.fillPath(path, fill)
+
+        edge = QLinearGradient(0, 0, 0, self.height())
+        edge.setColorAt(0.0, QColor(255, 255, 255, 90))
+        edge.setColorAt(0.2, QColor(255, 255, 255, 36))
+        edge.setColorAt(1.0, QColor(255, 255, 255, 24))
+        p.setPen(QPen(QBrush(edge), 1))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(path)
+
+        # signature gold light-line
+        w = self.width()
+        line = QLinearGradient(self.RADIUS, 0, w - self.RADIUS, 0)
+        line.setColorAt(0.0, QColor(226, 182, 89, 0))
+        line.setColorAt(0.5, QColor(243, 219, 155, 210))
+        line.setColorAt(1.0, QColor(226, 182, 89, 0))
+        p.setPen(QPen(QBrush(line), 1.5))
+        p.drawLine(QPointF(self.RADIUS, 1.0), QPointF(w - self.RADIUS, 1.0))
+
+
+class BrandMark(QWidget):
+    """Small gold diamond used as the Prestige logo."""
+
+    def __init__(self):
+        super().__init__()
+        self.setFixedSize(18, 18)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        cx = cy = 9.0
+        outer = QPainterPath()
+        for i, (dx, dy) in enumerate([(0, -8), (8, 0), (0, 8), (-8, 0)]):
+            (outer.moveTo if i == 0 else outer.lineTo)(QPointF(cx + dx, cy + dy))
+        outer.closeSubpath()
+        g = QLinearGradient(0, 0, 18, 18)
+        g.setColorAt(0.0, QColor(243, 219, 155))
+        g.setColorAt(1.0, QColor(185, 138, 46))
+        p.fillPath(outer, g)
+        inner = QPainterPath()
+        for i, (dx, dy) in enumerate([(0, -3.6), (3.6, 0), (0, 3.6), (-3.6, 0)]):
+            (inner.moveTo if i == 0 else inner.lineTo)(QPointF(cx + dx, cy + dy))
+        inner.closeSubpath()
+        p.fillPath(inner, QColor(24, 20, 14, 235))
+
+
+class ChromeButton(QAbstractButton):
+    """Custom-drawn window/toolbar control with a hover micro-animation.
+
+    min:      a short dash that stretches and turns amber
+    close:    a tiny dot that blooms into an X and turns red
+    log:      list lines that fan out
+    settings: slider knobs that glide past each other
+    """
+    HOVER = {
+        "min": (255, 196, 84, 255), "close": (255, 99, 99, 255),
+        "log": (243, 219, 155, 255), "settings": (243, 219, 155, 255),
+    }
+
+    def __init__(self, kind, slot, tip=""):
+        super().__init__()
+        self.kind = kind
+        self.setFixedSize(28, 26)
+        self.setToolTip(tip)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._t = 0.0
+        self._anim = QVariantAnimation(self)
+        self._anim.setDuration(170)
+        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._anim.valueChanged.connect(self._on_value)
+        self.clicked.connect(slot)
+
+    def _on_value(self, v):
+        self._t = float(v)
+        self.update()
+
+    def _go(self, end):
+        self._anim.stop()
+        self._anim.setStartValue(self._t)
+        self._anim.setEndValue(end)
+        self._anim.start()
+
+    def enterEvent(self, e):
+        self._go(1.0)
+        super().enterEvent(e)
+
+    def leaveEvent(self, e):
+        self._go(0.0)
+        super().leaveEvent(e)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        t, w, h = self._t, self.width(), self.height()
+        cx, cy = w / 2, h / 2
+        hov = self.HOVER[self.kind]
+
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(hov[0], hov[1], hov[2], int(40 * t)))
+        p.drawRoundedRect(QRectF(0, 0, w, h), 7, 7)
+
+        col = _mix((255, 255, 255, 150), hov, t)
+        pen = QPen(col, 1.7)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+
+        if self.kind == "min":
+            half = 3.5 + 3.5 * t
+            p.drawLine(QPointF(cx - half, cy + 3), QPointF(cx + half, cy + 3))
+        elif self.kind == "close":
+            arm = 0.9 + 4.2 * t
+            p.drawLine(QPointF(cx - arm, cy - arm), QPointF(cx + arm, cy + arm))
+            p.drawLine(QPointF(cx - arm, cy + arm), QPointF(cx + arm, cy - arm))
+        elif self.kind == "log":
+            spread = 3.5 + 1.5 * t
+            for i, dy in enumerate((-spread, 0, spread)):
+                right = 6 if i < 2 else 3 + 3 * t
+                p.drawLine(QPointF(cx - 6, cy + dy), QPointF(cx - 6 + right * 2, cy + dy))
+        elif self.kind == "settings":
+            y1, y2 = cy - 3.5, cy + 3.5
+            p.drawLine(QPointF(cx - 6.5, y1), QPointF(cx + 6.5, y1))
+            p.drawLine(QPointF(cx - 6.5, y2), QPointF(cx + 6.5, y2))
+            p.setBrush(col)
+            p.drawEllipse(QPointF(cx - 3 + 6 * t, y1), 2.2, 2.2)
+            p.drawEllipse(QPointF(cx + 3 - 6 * t, y2), 2.2, 2.2)
+
+
+class FocusLineEdit(QLineEdit):
+    focusChanged = pyqtSignal(bool)
+
+    def focusInEvent(self, e):
+        super().focusInEvent(e)
+        self.focusChanged.emit(True)
+
+    def focusOutEvent(self, e):
+        super().focusOutEvent(e)
+        self.focusChanged.emit(False)
+
+
+class ToggleSwitch(QAbstractButton):
+    """Squared-off switch with a gold track and a knob that slides. Use like a checkbox."""
+
+    def __init__(self, checked=False):
+        super().__init__()
+        self.setCheckable(True)
+        self.setChecked(checked)
+        self.setFixedSize(42, 22)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._t = 1.0 if checked else 0.0
+        self._anim = QVariantAnimation(self)
+        self._anim.setDuration(200)
+        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._anim.valueChanged.connect(self._on_value)
+        self.toggled.connect(self._on_toggled)
+
+    def _on_value(self, v):
+        self._t = float(v)
+        self.update()
+
+    def _on_toggled(self, on):
+        self._anim.stop()
+        self._anim.setStartValue(self._t)
+        self._anim.setEndValue(1.0 if on else 0.0)
+        self._anim.start()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        t, w, h = self._t, self.width(), self.height()
+        p.setPen(QPen(_mix((255, 255, 255, 50), (226, 182, 89, 0), t), 1))
+        p.setBrush(_mix((0, 0, 0, 70), (226, 182, 89, 255), t))
+        p.drawRoundedRect(QRectF(0.5, 0.5, w - 1, h - 1), 6, 6)
+        d = h - 8
+        x = 4 + t * (w - d - 8)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(_mix((235, 235, 240, 255), (30, 22, 10, 255), t))
+        p.drawRoundedRect(QRectF(x, 4, d, d), 4, 4)
+
+
+class SegmentedControl(QWidget):
+    """Segmented control with a sliding gold selection plate."""
+    changed = pyqtSignal(int)
+
+    def __init__(self, items, index=0):
+        super().__init__()
+        self._items = items
+        self._index = index
+        self._pos = float(index)
+        self.setFixedSize(176, 30)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._anim = QVariantAnimation(self)
+        self._anim.setDuration(220)
+        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._anim.valueChanged.connect(self._on_value)
+
+    def currentIndex(self):
+        return self._index
+
+    def _on_value(self, v):
+        self._pos = float(v)
+        self.update()
+
+    def setIndex(self, i):
+        if i == self._index:
+            return
+        self._index = i
+        self._anim.stop()
+        self._anim.setStartValue(self._pos)
+        self._anim.setEndValue(float(i))
+        self._anim.start()
+        self.changed.emit(i)
+
+    def mousePressEvent(self, e):
+        seg = self.width() / len(self._items)
+        self.setIndex(max(0, min(len(self._items) - 1, int(e.position().x() // seg))))
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h, n = self.width(), self.height(), len(self._items)
+        p.setPen(QPen(QColor(255, 255, 255, 30), 1))
+        p.setBrush(QColor(0, 0, 0, 70))
+        p.drawRoundedRect(QRectF(0.5, 0.5, w - 1, h - 1), 8, 8)
+        seg = (w - 6) / n
+        p.setPen(QPen(QColor(226, 182, 89, 140), 1))
+        p.setBrush(QColor(226, 182, 89, 52))
+        p.drawRoundedRect(QRectF(3 + self._pos * seg, 3, seg, h - 6), 6, 6)
+        font = p.font()
+        font.setPixelSize(12)
+        font.setWeight(QFont.Weight.DemiBold)
+        p.setFont(font)
+        for i, name in enumerate(self._items):
+            p.setPen(QColor(243, 219, 155) if i == self._index else QColor(255, 255, 255, 160))
+            p.drawText(QRectF(3 + i * seg, 3, seg, h - 6), Qt.AlignmentFlag.AlignCenter, name)
 
 
 # ----------------------------------------------------------------------------
 # HUD
 # ----------------------------------------------------------------------------
 class FluentGlassHUD(QWidget):
-    SHADOW = 14
-    PANEL_H = 112
+    SHADOW = 18
+    PANEL_H = 118
 
     def __init__(self):
         super().__init__()
@@ -518,17 +818,25 @@ class FluentGlassHUD(QWidget):
             self.output_area.setPlainText(
                 "No API key found.\nAdd GEMINI_API_KEY=... to your .env file and restart."
             )
+        elif KEY_WARNING:
+            self.output_area.setPlainText(KEY_WARNING)
 
     # ---- window plumbing --------------------------------------------------
     def paintEvent(self, _):
-        """Soft drop shadow drawn by hand (cheap, no graphics effect re-rendering)."""
+        """Soft drop shadow drawn by hand, clipped so it never darkens the glass itself."""
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.setPen(Qt.PenStyle.NoPen)
         base = QRectF(self.rect()).adjusted(self.SHADOW, self.SHADOW, -self.SHADOW, -self.SHADOW)
-        for i in range(self.SHADOW, 0, -1):
-            p.setBrush(QColor(0, 0, 0, 5))
-            p.drawRoundedRect(base.adjusted(-i, -i + 2, i, i + 2), 16 + i, 16 + i)
+        outside = QPainterPath()
+        outside.addRect(QRectF(self.rect()))
+        hole = QPainterPath()
+        hole.addRoundedRect(base, GlassPanel.RADIUS, GlassPanel.RADIUS)
+        p.setClipPath(outside.subtracted(hole))
+        p.setPen(Qt.PenStyle.NoPen)
+        r0 = GlassPanel.RADIUS
+        for i in range(self.SHADOW - 4, 0, -1):
+            p.setBrush(QColor(0, 0, 0, 6))
+            p.drawRoundedRect(base.adjusted(-i, -i + 4, i, i + 4), r0 + i, r0 + i)
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -601,97 +909,119 @@ class FluentGlassHUD(QWidget):
     def init_ui(self):
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.setMinimumSize(380, 340)
-        self.resize(560, 480)
+        self.setMinimumSize(420, 340)
+        self.resize(440, 400)
+
+        self.settings = QSettings("Prestige", "PrestigeHUD")
 
         root = QVBoxLayout(self)
         root.setContentsMargins(self.SHADOW, self.SHADOW, self.SHADOW, self.SHADOW)
 
-        self.container = QFrame(self)
-        self.container.setObjectName("GlassMain")
-        self.container.setStyleSheet("""
-            QFrame#GlassMain {
-                background-color: rgba(18, 20, 29, 0.95);
-                border: 1px solid rgba(255,255,255,0.18);
-                border-radius: 16px;
-            }
-            QLabel, QCheckBox { color: #ffffff; font-family: 'Segoe UI', sans-serif; }
-        """)
+        self.container = GlassPanel(self)
+        self.container.setStyleSheet(PANEL_QSS)
         cl = QVBoxLayout(self.container)
-        cl.setContentsMargins(16, 12, 16, 12)
-        cl.setSpacing(10)
+        cl.setContentsMargins(18, 14, 18, 12)
+        cl.setSpacing(12)
 
-        # top bar
+        # -- header: brand on the left, controls on the right
         top = QHBoxLayout()
-        self.settings_btn = self._icon_btn("⚙", 26, self.toggle_settings)
-        self.history_btn = self._icon_btn("📋 Log", 62, self.toggle_history)
-        top.addWidget(self.settings_btn)
+        top.setSpacing(2)
+        top.addWidget(BrandMark(), 0, Qt.AlignmentFlag.AlignVCenter)
+        top.addSpacing(8)
+        word = QLabel("PRESTIGE")
+        word.setStyleSheet("font-size: 11px; font-weight: 800; color: #EBCB86;")
+        wf = word.font()
+        wf.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 2.6)
+        word.setFont(wf)
+        top.addWidget(word, 0, Qt.AlignmentFlag.AlignVCenter)
+        top.addStretch()
+
+        self.history_btn = ChromeButton("log", self.toggle_history, "Activity log")
+        self.settings_btn = ChromeButton("settings", self.toggle_settings, "Settings")
         top.addWidget(self.history_btn)
-        handle = QWidget()
-        handle.setFixedSize(38, 4)
-        handle.setStyleSheet("background-color: rgba(255,255,255,0.35); border-radius: 2px;")
-        top.addStretch()
-        top.addWidget(handle)
-        top.addStretch()
-        top.addWidget(self._icon_btn("—", 26, self.showMinimized))
-        top.addWidget(self._icon_btn("✕", 26, self.request_close))
+        top.addWidget(self.settings_btn)
+        top.addSpacing(6)
+        divider = QFrame()
+        divider.setFixedSize(1, 14)
+        divider.setStyleSheet("background-color: rgba(255,255,255,0.18);")
+        top.addWidget(divider, 0, Qt.AlignmentFlag.AlignVCenter)
+        top.addSpacing(6)
+        top.addWidget(ChromeButton("min", self.showMinimized, "Minimize"))
+        top.addWidget(ChromeButton("close", self.request_close, "Close"))
         cl.addLayout(top)
 
         self.stacked = QStackedWidget()
 
-        # ---- main page
+        # ---- main page --------------------------------------------------
         main_view = QWidget()
         ml = QVBoxLayout(main_view)
         ml.setContentsMargins(0, 0, 0, 0)
-        ml.setSpacing(10)
+        ml.setSpacing(12)
 
-        self.input_field = QLineEdit()
-        self.input_field.setPlaceholderText("Ask about your screen, or give a command…")
-        self.input_field.setStyleSheet("""
-            QLineEdit {
-                background-color: rgba(255,255,255,0.09); color: #ffffff;
-                border: 1px solid rgba(255,255,255,0.18); border-radius: 10px; padding: 8px 12px;
-            }
-            QLineEdit:focus { border: 1px solid rgba(255,255,255,0.45); background-color: rgba(255,255,255,0.12); }
-        """)
+        self.input_pill = QFrame()
+        self.input_pill.setObjectName("pill")
+        self._set_pill_focus(False)
+        pl = QHBoxLayout(self.input_pill)
+        pl.setContentsMargins(16, 6, 6, 6)
+        pl.setSpacing(8)
+
+        self.input_field = FocusLineEdit()
+        self.input_field.setPlaceholderText("Ask Prestige about your screen")
+        self.input_field.setStyleSheet(
+            f"QLineEdit {{ background: transparent; border: none; color: rgba(255,255,255,0.97);"
+            f" font-family: {FONT_STACK}; font-size: 15px;"
+            f" selection-background-color: rgba(226,182,89,0.45); }}"
+        )
+        pal = self.input_field.palette()
+        pal.setColor(QPalette.ColorRole.PlaceholderText, QColor(255, 255, 255, 110))
+        self.input_field.setPalette(pal)
+        self.input_field.focusChanged.connect(self._set_pill_focus)
         self.input_field.returnPressed.connect(self.on_capture)
-        ml.addWidget(self.input_field)
+        pl.addWidget(self.input_field, 1)
 
-        self.btn_capture = QPushButton("Analyze Screen  (Ctrl+Shift+P)")
+        self.btn_capture = QPushButton("→")
+        self.btn_capture.setFixedSize(34, 34)
         self.btn_capture.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_capture.setStyleSheet(MAIN_BTN)
+        self.btn_capture.setToolTip("Analyze screen (Ctrl+Shift+P)")
+        self.btn_capture.setStyleSheet(SEND_BTN)
         self.btn_capture.clicked.connect(self.on_capture)
-        ml.addWidget(self.btn_capture)
+        pl.addWidget(self.btn_capture)
+        ml.addWidget(self.input_pill)
 
-        # confirmation panel (slides open when an action needs approval)
+        # approval sheet
         self.confirm_panel = QFrame()
-        self.confirm_panel.setStyleSheet("""
-            QFrame { background-color: rgba(255,190,70,0.12);
-                     border: 1px solid rgba(255,190,70,0.55); border-radius: 10px; }
-            QLabel { background: transparent; border: none; }
-        """)
-        pl = QVBoxLayout(self.confirm_panel)
-        pl.setContentsMargins(12, 8, 12, 8)
-        pl.setSpacing(6)
-        title = QLabel("Approve this action?")
-        title.setStyleSheet("font-weight: 700; color: #ffd27a;")
+        self.confirm_panel.setObjectName("sheet")
+        self.confirm_panel.setStyleSheet(
+            "QFrame#sheet { background-color: rgba(0,0,0,0.30);"
+            " border: 1px solid rgba(226,182,89,0.40); border-radius: 10px; }"
+            " QLabel { background: transparent; border: none; }"
+        )
+        sh = QVBoxLayout(self.confirm_panel)
+        sh.setContentsMargins(14, 10, 14, 10)
+        sh.setSpacing(4)
+        sheet_title = QLabel("Approve this action?")
+        sheet_title.setStyleSheet("font-weight: 700; font-size: 12px; color: #F3DB9B;")
         self.confirm_label = QLabel("")
         self.confirm_label.setWordWrap(True)
-        pl.addWidget(title)
-        pl.addWidget(self.confirm_label, 1)
+        self.confirm_label.setStyleSheet("font-size: 12px; color: rgba(255,255,255,0.80);")
+        sh.addWidget(sheet_title)
+        sh.addWidget(self.confirm_label, 1)
         row = QHBoxLayout()
+        row.setSpacing(8)
         self.btn_approve = QPushButton("Approve")
         self.btn_approve.setStyleSheet(APPROVE_BTN)
+        self.btn_approve.setFixedHeight(28)
         self.btn_approve.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_approve.clicked.connect(self.on_approve)
-        self.btn_cancel = QPushButton("Cancel (Esc)")
+        self.btn_cancel = QPushButton("Cancel")
         self.btn_cancel.setStyleSheet(CANCEL_BTN)
+        self.btn_cancel.setFixedHeight(28)
         self.btn_cancel.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_cancel.clicked.connect(self.on_cancel)
         row.addWidget(self.btn_approve)
         row.addWidget(self.btn_cancel)
         row.addStretch()
-        pl.addLayout(row)
+        sh.addLayout(row)
         self.confirm_panel.setMaximumHeight(0)
         self.confirm_panel.setVisible(False)
         ml.addWidget(self.confirm_panel)
@@ -699,83 +1029,159 @@ class FluentGlassHUD(QWidget):
         self.shimmer = ShimmerBar()
         ml.addWidget(self.shimmer)
 
+        # answers sit on a soft dark scrim so text stays readable on transparent glass
         self.output_area = QTextEdit()
         self.output_area.setReadOnly(True)
-        self.output_area.setPlaceholderText("Ready. Press Ctrl+Shift+P from anywhere.")
-        self.output_area.setStyleSheet("""
-            QTextEdit {
-                background-color: rgba(0,0,0,0.45); color: #ffffff;
-                border: 1px solid rgba(255,255,255,0.12); border-radius: 10px; padding: 10px;
-            }
-        """)
+        self.output_area.setFrameShape(QFrame.Shape.NoFrame)
+        self.output_area.setPlaceholderText("Ask anything about your screen.")
+        self.output_area.setStyleSheet(
+            f"QTextEdit {{ background-color: rgba(0,0,0,0.24); border: none; border-radius: 10px;"
+            f" color: rgba(255,255,255,0.96); font-family: {FONT_STACK}; font-size: 14px;"
+            f" padding: 8px 10px; selection-background-color: rgba(226,182,89,0.45); }}"
+        )
+        pal = self.output_area.palette()
+        pal.setColor(QPalette.ColorRole.PlaceholderText, QColor(255, 255, 255, 90))
+        self.output_area.setPalette(pal)
         ml.addWidget(self.output_area, 1)
         self.stacked.addWidget(main_view)
 
-        # ---- settings page
+        # ---- settings page: header stays pinned, body scrolls when the window is small
         sv = QWidget()
-        sl = QVBoxLayout(sv)
-        sl.setContentsMargins(0, 0, 0, 0)
-        sl.setSpacing(10)
-        t = QLabel("Settings")
-        t.setStyleSheet("font-size: 14px; font-weight: bold;")
-        sl.addWidget(t)
-        self.chk_audio = QCheckBox("Enable text-to-speech audio")
-        self.chk_audio.setChecked(True)
-        sl.addWidget(self.chk_audio)
-        self.chk_auto = QCheckBox("Run actions without asking (risky)")
-        self.chk_auto.setChecked(False)
-        sl.addWidget(self.chk_auto)
-        note = QLabel("Commands always ask first, even with this on.")
-        note.setStyleSheet("color: rgba(255,255,255,0.55); font-size: 11px;")
-        sl.addWidget(note)
-        sl.addWidget(QLabel("Response mode:"))
-        self.combo_mode = QComboBox()
-        self.combo_mode.addItems(["Concise", "Detailed"])
-        self.combo_mode.setStyleSheet("background: rgba(255,255,255,0.1); color: white; padding: 4px;")
-        sl.addWidget(self.combo_mode)
+        svl = QVBoxLayout(sv)
+        svl.setContentsMargins(0, 0, 0, 0)
+        svl.setSpacing(8)
+        svl.addLayout(self._page_header("Settings"))
+
+        self.chk_audio = ToggleSwitch(self.settings.value("voice", True, type=bool))
+        self.chk_audio.toggled.connect(lambda on: self.settings.setValue("voice", on))
+        self.chk_auto = ToggleSwitch(False)   # deliberately never remembered
+        self.combo_mode = SegmentedControl(["Concise", "Detailed"], self.settings.value("style", 0, type=int))
+        self.combo_mode.changed.connect(lambda i: self.settings.setValue("style", i))
+        self.opacity_slider = QSlider(Qt.Orientation.Horizontal)
+        self.opacity_slider.setRange(30, 95)
+        self.opacity_slider.setFixedWidth(130)
+        self.opacity_slider.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.opacity_slider.setValue(self.settings.value("glass", 66, type=int))
+        self.opacity_slider.valueChanged.connect(self._on_opacity)
+        self.container.set_opacity(self.opacity_slider.value() / 100.0)
+
+        body = QWidget()
+        sl = QVBoxLayout(body)
+        sl.setContentsMargins(0, 0, 8, 0)
+        sl.setSpacing(6)
+        sl.addWidget(self._section_label("Glass"))
+        sl.addWidget(self._settings_card([("Opacity", self.opacity_slider, "See more of your desktop")]))
+        sl.addWidget(self._section_label("Voice"))
+        sl.addWidget(self._settings_card([("Voice replies", self.chk_audio, "Speak answers aloud")]))
+        sl.addWidget(self._section_label("Safety"))
+        sl.addWidget(self._settings_card([("Run actions without asking", self.chk_auto, "Commands always ask first")]))
+        sl.addWidget(self._section_label("Response"))
+        sl.addWidget(self._settings_card([("Style", self.combo_mode, None)]))
         sl.addStretch()
-        b = QPushButton("← Back to HUD")
-        b.setStyleSheet(MAIN_BTN)
-        b.clicked.connect(self.toggle_settings)
-        sl.addWidget(b)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setStyleSheet(
+            "QScrollArea { background: transparent; border: none; }"
+            " QScrollArea > QWidget > QWidget { background: transparent; }"
+        )
+        scroll.setWidget(body)
+        svl.addWidget(scroll, 1)
         self.stacked.addWidget(sv)
 
-        # ---- history page
+        # ---- activity log page ------------------------------------------
         hv = QWidget()
         hl = QVBoxLayout(hv)
         hl.setContentsMargins(0, 0, 0, 0)
         hl.setSpacing(10)
-        ht = QLabel("Execution Log")
-        ht.setStyleSheet("font-size: 14px; font-weight: bold;")
-        hl.addWidget(ht)
+        hl.addLayout(self._page_header("Activity"))
         self.history_list = QListWidget()
         self.history_list.setWordWrap(True)
+        self.history_list.setFrameShape(QFrame.Shape.NoFrame)
         self.history_list.setStyleSheet(
-            "background-color: rgba(0,0,0,0.45); color: #ffffff; border-radius: 10px; padding: 4px;"
+            f"QListWidget {{ background-color: rgba(0,0,0,0.24); border: none; border-radius: 10px;"
+            f" outline: 0; color: rgba(255,255,255,0.90); font-family: {FONT_STACK}; font-size: 12px; }}"
+            f" QListWidget::item {{ padding: 9px 8px; border-bottom: 1px solid rgba(255,255,255,0.07); }}"
+            f" QListWidget::item:selected {{ background: rgba(226,182,89,0.14); color: #ffffff; }}"
         )
         hl.addWidget(self.history_list, 1)
-        hb = QPushButton("← Back to HUD")
-        hb.setStyleSheet(MAIN_BTN)
-        hb.clicked.connect(self.toggle_history)
-        hl.addWidget(hb)
         self.stacked.addWidget(hv)
 
         cl.addWidget(self.stacked, 1)
 
         bottom = QHBoxLayout()
+        hint = QLabel("CTRL + SHIFT + P  ·  summon from anywhere")
+        hint.setStyleSheet("font-size: 10px; color: rgba(255,255,255,0.62);")
+        bottom.addWidget(hint)
         bottom.addStretch()
         bottom.addWidget(QSizeGrip(self))
         cl.addLayout(bottom)
 
         root.addWidget(self.container)
 
-    def _icon_btn(self, text, width, slot):
-        btn = QPushButton(text)
-        btn.setFixedSize(width, 26)
-        btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn.setStyleSheet(ICON_BTN)
-        btn.clicked.connect(slot)
-        return btn
+    def _on_opacity(self, v):
+        self.container.set_opacity(v / 100.0)
+        self.settings.setValue("glass", v)
+
+    def _set_pill_focus(self, focused):
+        border = "rgba(226,182,89,0.85)" if focused else "rgba(255,255,255,0.14)"
+        bg = "rgba(0,0,0,0.42)" if focused else "rgba(0,0,0,0.34)"
+        self.input_pill.setStyleSheet(
+            f"QFrame#pill {{ background-color: {bg}; border: 1px solid {border}; border-radius: 12px; }}"
+        )
+
+    def _section_label(self, text):
+        lbl = QLabel(text.upper())
+        lbl.setStyleSheet("font-size: 10px; font-weight: 800; color: #E2B659; padding: 6px 2px 0 2px;")
+        f = lbl.font()
+        f.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 2.0)
+        lbl.setFont(f)
+        return lbl
+
+    def _page_header(self, title):
+        row = QHBoxLayout()
+        back = QPushButton("←  Back")
+        back.setFixedWidth(72)
+        back.setCursor(Qt.CursorShape.PointingHandCursor)
+        back.setStyleSheet(BACK_BTN)
+        back.clicked.connect(lambda: self.switch_page(0))
+        lbl = QLabel(title)
+        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lbl.setStyleSheet("font-size: 15px; font-weight: 700;")
+        spacer = QWidget()
+        spacer.setFixedWidth(72)
+        row.addWidget(back)
+        row.addWidget(lbl, 1)
+        row.addWidget(spacer)
+        return row
+
+    def _settings_card(self, rows):
+        card = QFrame()
+        card.setObjectName("card")
+        card.setStyleSheet(
+            "QFrame#card { background-color: rgba(0,0,0,0.24);"
+            " border: 1px solid rgba(255,255,255,0.08); border-radius: 10px; }"
+        )
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(14, 2, 14, 2)
+        lay.setSpacing(0)
+        for label, control, caption in rows:
+            row = QWidget()
+            h = QHBoxLayout(row)
+            h.setContentsMargins(0, 7, 0, 7)
+            col = QVBoxLayout()
+            col.setSpacing(1)
+            col.addWidget(QLabel(label))
+            if caption:
+                cap = QLabel(caption)
+                cap.setStyleSheet("font-size: 11px; color: rgba(255,255,255,0.50);")
+                col.addWidget(cap)
+            h.addLayout(col, 1)
+            h.addWidget(control, 0, Qt.AlignmentFlag.AlignVCenter)
+            lay.addWidget(row)
+        return card
 
     # ---- page + panel animation ------------------------------------------
     def switch_page(self, index):
@@ -861,7 +1267,6 @@ class FluentGlassHUD(QWidget):
         self.is_processing = busy
         self.btn_capture.setEnabled(not busy)
         self.input_field.setEnabled(not busy)
-        self.btn_capture.setText("Working…" if busy else "Analyze Screen  (Ctrl+Shift+P)")
         if busy:
             self.shimmer.start()
         else:
@@ -895,7 +1300,8 @@ class FluentGlassHUD(QWidget):
 
     def _grab_and_start(self, query):
         try:
-            with mss.mss() as sct:
+            grabber = getattr(mss, "MSS", None) or mss.mss
+            with grabber() as sct:
                 mon = sct.monitors[1]
                 shot = sct.grab(mon)
                 image = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
@@ -1025,6 +1431,10 @@ class FluentGlassHUD(QWidget):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+    font = QFont()
+    font.setFamilies(["Segoe UI Variable Text", "Segoe UI"])
+    font.setPointSize(10)
+    app.setFont(font)
     hud = FluentGlassHUD()
     hud.show()
     sys.exit(app.exec())
