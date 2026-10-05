@@ -5,6 +5,7 @@ import re
 import time
 import json
 import asyncio
+import base64
 import tempfile
 import threading
 import subprocess
@@ -15,6 +16,7 @@ from urllib.parse import urlparse
 
 import mss
 from PIL import Image
+import httpx
 from dotenv import load_dotenv
 
 import pyautogui
@@ -44,21 +46,66 @@ from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 # ----------------------------------------------------------------------------
 load_dotenv(override=True)   # the project's .env wins over stray system environment variables
 
-KEY_WARNING = ""
-try:
-    _api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-    if _api_key and not _api_key.startswith("AIza"):
-        KEY_WARNING = (
-            "This key doesn't look like a Gemini API key (they start with AIza).\n"
-            "Create one at aistudio.google.com/app/apikey and put it in .env as GEMINI_API_KEY."
-        )
-        print(f"[Init] {KEY_WARNING}")
-    client = genai.Client(api_key=_api_key)
-except Exception as e:
-    client = None
-    print(f"[Init] Gemini client unavailable: {e}")
+_names = ("GROQ_API_KEY", "XAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY")
+_cands = [(os.getenv(n) or "").strip() for n in _names]
+# keys pasted into the wrong variable are still recognised by their prefix
+GROQ_KEY = next((k for k in _cands if k.startswith("gsk_")), "") or _cands[0]
+XAI_KEY = next((k for k in _cands if k.startswith("xai-")), "") or _cands[1]
+_gem_key = next((k for k in _cands[2:] if k and not k.startswith(("gsk_", "xai-"))), "")
+_auto = "groq" if GROQ_KEY else ("xai" if XAI_KEY else "gemini")
+PROVIDER = (os.getenv("PRESTIGE_PROVIDER") or _auto).strip().lower()
 
-DEFAULT_MODELS = ["gemini-2.5-flash", "gemini-2.5-pro"]
+client = None
+if PROVIDER == "gemini" and _gem_key:
+    try:
+        client = genai.Client(api_key=_gem_key)
+    except Exception as e:
+        print(f"[Init] Gemini client unavailable: {e}")
+AI_READY = {"groq": bool(GROQ_KEY), "xai": bool(XAI_KEY)}.get(PROVIDER, client is not None)
+KEY_WARNING = ""
+print(f"[Init] Provider: {PROVIDER} (ready: {AI_READY})")
+
+DEFAULT_MODELS = ["gemini-flash-latest", "gemini-3.6-flash", "gemini-2.5-flash"]
+XAI_URL = "https://api.x.ai/v1/chat/completions"
+GROQ_BASE = "https://api.groq.com/openai/v1"
+GROQ_DEFAULTS = ["meta-llama/llama-4-scout-17b-16e-instruct",
+                 "meta-llama/llama-4-maverick-17b-128e-instruct"]
+_groq_cache = None
+
+
+def get_groq_models():
+    """Vision-capable Groq models for this key: override, then discovered, then known defaults."""
+    global _groq_cache
+    if _groq_cache:
+        return _groq_cache
+    models = []
+    forced = os.getenv("GROQ_MODEL", "").strip()
+    if forced:
+        models.append(forced)
+    try:
+        r = httpx.get(f"{GROQ_BASE}/models", headers={"Authorization": f"Bearer {GROQ_KEY}"}, timeout=15)
+        if r.status_code == 200:
+            ids = [m.get("id", "") for m in r.json().get("data", []) if m.get("active", True)]
+            vision = [i for i in ids if any(k in i for k in ("llama-4", "vision", "scout", "maverick"))
+                      and "guard" not in i]
+            models += sorted(vision, reverse=True)
+            print(f"[Groq] Candidate vision models: {vision}")
+    except Exception as err:
+        print(f"[Groq] Model discovery failed, using defaults: {err}")
+    for d in GROQ_DEFAULTS:
+        if d not in models:
+            models.append(d)
+    _groq_cache = models
+    return models
+
+
+def get_xai_models():
+    forced = os.getenv("XAI_MODEL", "").strip()
+    models = [forced] if forced else []
+    for m in ("grok-4.3", "grok-4"):
+        if m not in models:
+            models.append(m)
+    return models
 _EXCLUDED = ("image", "tts", "live", "audio", "embedding", "aqa", "imagen",
              "veo", "robotics", "computer-use", "learnlm", "gemma")
 _model_cache = None
@@ -309,6 +356,57 @@ class AgentWorker(QThread):
         return buf.getvalue()
 
     def _ask(self, jpeg):
+        if PROVIDER == "groq":
+            return self._ask_compat(jpeg, f"{GROQ_BASE}/chat/completions", GROQ_KEY,
+                                    get_groq_models(), "Groq", merge_system=True)
+        if PROVIDER == "xai":
+            return self._ask_compat(jpeg, XAI_URL, XAI_KEY, get_xai_models(), "xAI", detail="high")
+        return self._ask_gemini(jpeg)
+
+    def _ask_compat(self, jpeg, url, key, models, label, merge_system=False, detail=None):
+        """OpenAI-style chat completions with an image (works for xAI and Groq)."""
+        b64 = base64.b64encode(jpeg).decode()
+        instruction = build_system_instruction(self.mode)
+        image = {"url": f"data:image/jpeg;base64,{b64}"}
+        if detail:
+            image["detail"] = detail
+        task = f"Task: {self.query}"
+        if merge_system:   # some vision models ignore system prompts, so put the rules in the user turn
+            messages = [{"role": "user", "content": [
+                {"type": "image_url", "image_url": image},
+                {"type": "text", "text": f"{instruction}\n\n{task}"}]}]
+        else:
+            messages = [
+                {"role": "system", "content": instruction},
+                {"role": "user", "content": [
+                    {"type": "image_url", "image_url": image},
+                    {"type": "text", "text": task}]},
+            ]
+        last_err = "no model responded"
+        for model in models:
+            if self.isInterruptionRequested():
+                return None, "cancelled"
+            try:
+                r = httpx.post(url, headers={"Authorization": f"Bearer {key}"},
+                               json={"model": model, "messages": messages}, timeout=90)
+                if r.status_code != 200:
+                    last_err = f"{label} {model}: HTTP {r.status_code} {r.text[:160]}"
+                    print(f"[{label} failure] {last_err}")
+                    if r.status_code in (401, 403):   # bad key / no credits: other models won't help
+                        break
+                    continue
+                text = (r.json()["choices"][0]["message"]["content"] or "").strip()
+                if not text:
+                    last_err = f"{label} {model} returned an empty response"
+                    continue
+                plan = extract_json_payload(text) or {"message": text, "action": "none"}
+                return plan, None
+            except Exception as err:
+                last_err = f"{label} {model}: {str(err)[:160]}"
+                print(f"[{label} failure] {last_err}")
+        return None, last_err
+
+    def _ask_gemini(self, jpeg):
         contents = [
             types.Part.from_bytes(data=jpeg, mime_type="image/jpeg"),
             f"Task: {self.query}",
@@ -814,12 +912,11 @@ class FluentGlassHUD(QWidget):
 
         self.init_ui()
 
-        if client is None:
+        if not AI_READY:
             self.output_area.setPlainText(
-                "No API key found.\nAdd GEMINI_API_KEY=... to your .env file and restart."
+                "No API key found.\nAdd GROQ_API_KEY=... (free), XAI_API_KEY=... or "
+                "GEMINI_API_KEY=... to your .env file and restart."
             )
-        elif KEY_WARNING:
-            self.output_area.setPlainText(KEY_WARNING)
 
     # ---- window plumbing --------------------------------------------------
     def paintEvent(self, _):
@@ -1283,8 +1380,10 @@ class FluentGlassHUD(QWidget):
     def on_capture(self):
         if self.is_processing:
             return
-        if client is None:
-            self.output_area.setPlainText("No API key found. Add GEMINI_API_KEY to .env and restart.")
+        if not AI_READY:
+            self.output_area.setPlainText(
+                "No API key found. Add GROQ_API_KEY (free), XAI_API_KEY or GEMINI_API_KEY to .env and restart."
+            )
             return
 
         self._discard_pending()
