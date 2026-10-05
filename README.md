@@ -8,7 +8,7 @@ Prestige provides an overlay interface for real-time visual screen capture, voic
 
 ## Project Screenshot
 
-![Project Screenshot](./C:\Users\v7lt\Pictures\Screenshots\Screenshot-Prstige)
+![Project Screenshot](./images/Screenshot-Prstige.png)
 
 ## Features
 
