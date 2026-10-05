@@ -5,10 +5,9 @@ A translucent, frameless desktop AI automation HUD built with Python, PyQt6, and
 Prestige provides an overlay interface for real-time visual screen capture, voice synthesis, and dynamic AI model interaction directly from your desktop.
 
 ---
-
 ## Project Screenshot
 
-![Project Screenshot](./images/Screenshot-Prstige.png)
+![Project Screenshot](./Screenshot-Prstige.png)
 
 ## Features
 
