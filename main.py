@@ -1,5 +1,6 @@
 import sys
 import os
+from pathlib import Path
 import io
 import re
 import time
@@ -17,7 +18,7 @@ from urllib.parse import urlparse
 import mss
 from PIL import Image
 import httpx
-from dotenv import load_dotenv
+from dotenv import load_dotenv, set_key
 
 import pyautogui
 pyautogui.FAILSAFE = True   # slam the mouse into a screen corner to abort
@@ -44,26 +45,60 @@ from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 # ----------------------------------------------------------------------------
 # Setup
 # ----------------------------------------------------------------------------
-load_dotenv(override=True)   # the project's .env wins over stray system environment variables
+ENV_PATH = Path(__file__).resolve().with_name(".env")   # always next to main.py, whatever the cwd
+PROVIDER_VARS = {"groq": "GROQ_API_KEY", "xai": "XAI_API_KEY", "gemini": "GEMINI_API_KEY"}
+PROVIDER_LABELS = {"groq": "Groq", "xai": "Grok (xAI)", "gemini": "Gemini"}
+PROVIDER_HINTS = {   # key prefix, URL to get a key, text shown for the link
+    "groq": ("gsk_", "https://console.groq.com/keys", "console.groq.com/keys"),
+    "xai": ("xai-", "https://console.x.ai", "console.x.ai"),
+    "gemini": ("", "https://aistudio.google.com/app/apikey", "aistudio.google.com/app/apikey"),
+}
 
-_names = ("GROQ_API_KEY", "XAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY")
-_cands = [(os.getenv(n) or "").strip() for n in _names]
-# keys pasted into the wrong variable are still recognised by their prefix
-GROQ_KEY = next((k for k in _cands if k.startswith("gsk_")), "") or _cands[0]
-XAI_KEY = next((k for k in _cands if k.startswith("xai-")), "") or _cands[1]
-_gem_key = next((k for k in _cands[2:] if k and not k.startswith(("gsk_", "xai-"))), "")
-_auto = "groq" if GROQ_KEY else ("xai" if XAI_KEY else "gemini")
-PROVIDER = (os.getenv("PRESTIGE_PROVIDER") or _auto).strip().lower()
-
+GROQ_KEY = XAI_KEY = _gem_key = ""
+PROVIDER = "gemini"
 client = None
-if PROVIDER == "gemini" and _gem_key:
-    try:
-        client = genai.Client(api_key=_gem_key)
-    except Exception as e:
-        print(f"[Init] Gemini client unavailable: {e}")
-AI_READY = {"groq": bool(GROQ_KEY), "xai": bool(XAI_KEY)}.get(PROVIDER, client is not None)
+AI_READY = False
 KEY_WARNING = ""
-print(f"[Init] Provider: {PROVIDER} (ready: {AI_READY})")
+_groq_cache = None
+_model_cache = None
+
+
+def active_key():
+    return {"groq": GROQ_KEY, "xai": XAI_KEY}.get(PROVIDER, _gem_key)
+
+
+def _mask(k):
+    return f"{k[:4]}...({len(k)} chars)" if k else "none"
+
+
+def configure_providers():
+    """(Re)read keys from .env / the environment and pick a provider. Safe to call at runtime."""
+    global GROQ_KEY, XAI_KEY, _gem_key, PROVIDER, client, AI_READY, _groq_cache, _model_cache
+    load_dotenv(ENV_PATH, override=True)    # the project's .env wins over stray system variables
+    names = ("GROQ_API_KEY", "XAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY")
+    cands = [(os.getenv(n) or "").strip() for n in names]
+    # keys pasted into the wrong variable are still recognised by their prefix
+    GROQ_KEY = next((k for k in cands if k.startswith("gsk_")), "") or cands[0]
+    XAI_KEY = next((k for k in cands if k.startswith("xai-")), "") or cands[1]
+    _gem_key = next((k for k in cands[2:] if k and not k.startswith(("gsk_", "xai-"))), "")
+    auto = "groq" if GROQ_KEY else ("xai" if XAI_KEY else "gemini")
+    PROVIDER = (os.getenv("PRESTIGE_PROVIDER") or auto).strip().lower()
+    if PROVIDER not in PROVIDER_VARS:
+        PROVIDER = auto
+    client = None
+    if PROVIDER == "gemini" and _gem_key:
+        try:
+            client = genai.Client(api_key=_gem_key)
+        except Exception as e:
+            print(f"[Init] Gemini client unavailable: {e}")
+    AI_READY = bool(active_key()) if PROVIDER != "gemini" else client is not None
+    _groq_cache = None
+    _model_cache = None
+    print(f"[Init] .env: {ENV_PATH} (found: {ENV_PATH.exists()}) | provider={PROVIDER} "
+          f"| key={_mask(active_key())} | ready={AI_READY}")
+
+
+configure_providers()
 
 DEFAULT_MODELS = ["gemini-flash-latest", "gemini-3.6-flash", "gemini-2.5-flash"]
 XAI_URL = "https://api.x.ai/v1/chat/completions"
@@ -106,6 +141,57 @@ def get_xai_models():
         if m not in models:
             models.append(m)
     return models
+
+
+def _interpret(label, status, body):
+    low = (body or "").lower()
+    if status == 200:
+        return True, f"{label}: key accepted \u2713"
+    if status == 401:
+        if "access_token_type_unsupported" in low:
+            return False, ("Google rejected this AQ. key (a known Google-side problem on some accounts). "
+                           "Try Groq, which is free.")
+        return False, f"{label}: invalid key (401). Check that you copied the whole key."
+    if status == 403:
+        if "credit" in low or "license" in low:
+            return False, f"{label}: the key is valid, but the account has no credits."
+        return False, f"{label}: access denied (403). {(body or '')[:100]}"
+    if status == 429:
+        return True, f"{label}: key is valid, but you're rate-limited right now. Wait a minute."
+    return False, f"{label}: unexpected response {status}: {(body or '')[:100]}"
+
+
+def test_connection():
+    """Cheap authenticated request. Returns (ok, message). Never raises."""
+    label = PROVIDER_LABELS.get(PROVIDER, PROVIDER)
+    key = active_key()
+    if not key:
+        return False, "No key saved for this provider yet."
+    try:
+        if PROVIDER == "groq":
+            r = httpx.get(f"{GROQ_BASE}/models", headers={"Authorization": f"Bearer {key}"}, timeout=15)
+            ok, msg = _interpret(label, r.status_code, r.text)
+            if r.status_code == 200:
+                ids = [m.get("id", "") for m in r.json().get("data", [])]
+                vision = [i for i in ids if any(k in i for k in ("llama-4", "vision", "scout", "maverick"))
+                          and "guard" not in i]
+                msg += (f" \u00b7 {len(vision)} vision model(s) available" if vision
+                        else " \u00b7 but no vision models found for this key")
+                ok = bool(vision)
+            return ok, msg
+        if PROVIDER == "xai":
+            r = httpx.get("https://api.x.ai/v1/models", headers={"Authorization": f"Bearer {key}"}, timeout=15)
+            ok, msg = _interpret(label, r.status_code, r.text)
+            if r.status_code == 200:
+                msg += " (chat may still need credits)"
+            return ok, msg
+        r = httpx.get("https://generativelanguage.googleapis.com/v1beta/models",
+                      headers={"x-goog-api-key": key}, timeout=15)
+        return _interpret(label, r.status_code, r.text)
+    except Exception as e:
+        return False, f"Couldn't reach {label}: {str(e)[:100]}"
+
+
 _EXCLUDED = ("image", "tts", "live", "audio", "embedding", "aqa", "imagen",
              "veo", "robotics", "computer-use", "learnlm", "gemma")
 _model_cache = None
@@ -480,6 +566,14 @@ class AgentWorker(QThread):
 # ----------------------------------------------------------------------------
 # Native hotkey
 # ----------------------------------------------------------------------------
+class KeyTestWorker(QThread):
+    done = pyqtSignal(bool, str)
+
+    def run(self):
+        ok, msg = test_connection()
+        self.done.emit(ok, msg)
+
+
 class WinHotkeyFilter(QAbstractNativeEventFilter):
     def __init__(self, callback):
         super().__init__()
@@ -913,10 +1007,8 @@ class FluentGlassHUD(QWidget):
         self.init_ui()
 
         if not AI_READY:
-            self.output_area.setPlainText(
-                "No API key found.\nAdd GROQ_API_KEY=... (free), XAI_API_KEY=... or "
-                "GEMINI_API_KEY=... to your .env file and restart."
-            )
+            self.output_area.setPlainText("Welcome! Pick a provider and paste an API key below to get started.")
+            self.stacked.setCurrentIndex(1)
 
     # ---- window plumbing --------------------------------------------------
     def paintEvent(self, _):
@@ -1166,6 +1258,8 @@ class FluentGlassHUD(QWidget):
         sl = QVBoxLayout(body)
         sl.setContentsMargins(0, 0, 8, 0)
         sl.setSpacing(6)
+        sl.addWidget(self._section_label("AI provider"))
+        sl.addWidget(self._build_provider_card())
         sl.addWidget(self._section_label("Glass"))
         sl.addWidget(self._settings_card([("Opacity", self.opacity_slider, "See more of your desktop")]))
         sl.addWidget(self._section_label("Voice"))
@@ -1228,6 +1322,137 @@ class FluentGlassHUD(QWidget):
         self.input_pill.setStyleSheet(
             f"QFrame#pill {{ background-color: {bg}; border: 1px solid {border}; border-radius: 12px; }}"
         )
+
+    # ---- AI provider card ---------------------------------------------------
+    def _build_provider_card(self):
+        card = QFrame()
+        card.setObjectName("card")
+        card.setStyleSheet(
+            "QFrame#card { background-color: rgba(0,0,0,0.24);"
+            " border: 1px solid rgba(255,255,255,0.08); border-radius: 10px; }"
+        )
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(14, 10, 14, 12)
+        lay.setSpacing(8)
+
+        self._provider_order = ["groq", "xai", "gemini"]
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Provider"), 1)
+        start = self._provider_order.index(PROVIDER) if (AI_READY and PROVIDER in self._provider_order) else 0
+        self.provider_ctl = SegmentedControl(["Groq", "Grok", "Gemini"], start)
+        self.provider_ctl.changed.connect(self._on_provider_changed)
+        row.addWidget(self.provider_ctl)
+        lay.addLayout(row)
+
+        self.key_input = QLineEdit()
+        self.key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.key_input.setStyleSheet(
+            f"QLineEdit {{ background-color: rgba(0,0,0,0.30); border: 1px solid rgba(255,255,255,0.14);"
+            f" border-radius: 8px; padding: 6px 10px; color: #ffffff; font-family: {FONT_STACK}; font-size: 12px;"
+            f" selection-background-color: rgba(226,182,89,0.45); }}"
+            f" QLineEdit:focus {{ border: 1px solid rgba(226,182,89,0.85); }}"
+        )
+        pal = self.key_input.palette()
+        pal.setColor(QPalette.ColorRole.PlaceholderText, QColor(255, 255, 255, 100))
+        self.key_input.setPalette(pal)
+        self.key_input.returnPressed.connect(self.on_save_key)
+        lay.addWidget(self.key_input)
+
+        self.key_link = QLabel()
+        self.key_link.setOpenExternalLinks(True)
+        self.key_link.setStyleSheet("font-size: 11px; color: rgba(255,255,255,0.55);")
+        lpal = self.key_link.palette()
+        lpal.setColor(QPalette.ColorRole.Link, QColor(226, 182, 89))
+        self.key_link.setPalette(lpal)
+        lay.addWidget(self.key_link)
+
+        row2 = QHBoxLayout()
+        self.btn_save_key = QPushButton("Save and Test")
+        self.btn_save_key.setStyleSheet(APPROVE_BTN)
+        self.btn_save_key.setFixedHeight(28)
+        self.btn_save_key.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_save_key.clicked.connect(self.on_save_key)
+        row2.addWidget(self.btn_save_key)
+        row2.addStretch()
+        lay.addLayout(row2)
+
+        self.key_status = QLabel("")
+        self.key_status.setWordWrap(True)
+        lay.addWidget(self.key_status)
+
+        self._on_provider_changed(self.provider_ctl.currentIndex())
+        if AI_READY:
+            self._set_key_status(f"Using {PROVIDER_LABELS[PROVIDER]} \u00b7 key {_mask(active_key())}", "info")
+        else:
+            self._set_key_status("No key set yet. Paste one above and press Save and Test.", "info")
+        return card
+
+    def _set_key_status(self, text, kind="info"):
+        color = {"ok": "#7FE0A0", "err": "#FF8A8A", "info": "rgba(255,255,255,0.60)"}[kind]
+        self.key_status.setStyleSheet(f"font-size: 11px; color: {color};")
+        self.key_status.setText(text)
+
+    def _on_provider_changed(self, index):
+        name = self._provider_order[index]
+        prefix, url, shown = PROVIDER_HINTS[name]
+        self.key_input.setPlaceholderText(
+            f"Paste your {PROVIDER_LABELS[name]} API key" + (f" ({prefix}\u2026)" if prefix else ""))
+        self.key_link.setText(
+            '<style>a { color: #E2B659; text-decoration: none; }</style>'
+            f'Get a key: <a href="{url}">{shown}</a>' + (" \u00b7 free tier" if name == "groq" else ""))
+
+    @staticmethod
+    def _ensure_gitignore():
+        gi = ENV_PATH.with_name(".gitignore")
+        text = gi.read_text(encoding="utf-8") if gi.exists() else ""
+        if ".env" not in [ln.strip() for ln in text.splitlines()]:
+            sep = "" if (not text or text.endswith("\n")) else "\n"
+            gi.write_text(text + sep + ".env\n", encoding="utf-8")
+
+    def on_save_key(self):
+        name = self._provider_order[self.provider_ctl.currentIndex()]
+        label = PROVIDER_LABELS[name]
+        key = self.key_input.text().strip().strip('"').strip("'")
+        if not key:
+            self._set_key_status("Paste your key first.", "err")
+            return
+        if key.startswith("xai-") and name != "xai":
+            self._set_key_status("That's an xAI (Grok) key. Pick Grok above.", "err")
+            return
+        if key.startswith("gsk_") and name != "groq":
+            self._set_key_status("That's a Groq key. Pick Groq above.", "err")
+            return
+        prefix = PROVIDER_HINTS[name][0]
+        if prefix and not key.startswith(prefix):
+            self._set_key_status(f"A {label} key should start with {prefix}", "err")
+            return
+        try:
+            ENV_PATH.touch(exist_ok=True)
+            set_key(str(ENV_PATH), PROVIDER_VARS[name], key, quote_mode="never")
+            set_key(str(ENV_PATH), "PRESTIGE_PROVIDER", name, quote_mode="never")
+            self._ensure_gitignore()
+        except Exception as e:
+            self._set_key_status(f"Couldn't write {ENV_PATH}: {e}", "err")
+            return
+        os.environ[PROVIDER_VARS[name]] = key
+        os.environ["PRESTIGE_PROVIDER"] = name
+        self.key_input.clear()
+        configure_providers()
+        self._set_key_status("Testing\u2026", "info")
+        self.btn_save_key.setEnabled(False)
+        worker = KeyTestWorker()
+        worker.done.connect(self._on_test_done)
+        worker.finished.connect(self._reap_worker)
+        self._workers.add(worker)
+        self._key_test = worker
+        worker.start()
+
+    def _on_test_done(self, ok, msg):
+        self.btn_save_key.setEnabled(True)
+        self._set_key_status(msg, "ok" if ok else "err")
+        if ok:
+            self._log(f"AI provider: {PROVIDER_LABELS[PROVIDER]}")
+            self.output_area.clear()
 
     def _section_label(self, text):
         lbl = QLabel(text.upper())
@@ -1381,9 +1606,8 @@ class FluentGlassHUD(QWidget):
         if self.is_processing:
             return
         if not AI_READY:
-            self.output_area.setPlainText(
-                "No API key found. Add GROQ_API_KEY (free), XAI_API_KEY or GEMINI_API_KEY to .env and restart."
-            )
+            self.output_area.setPlainText("Add an API key in Settings first.")
+            self.switch_page(1)
             return
 
         self._discard_pending()
@@ -1433,6 +1657,8 @@ class FluentGlassHUD(QWidget):
             return
         self._set_busy(False)
         self._stop_thinking()
+        if any(c in msg for c in ("401", "403", "404")):
+            msg += "\n\nOpen Settings \u2192 AI provider to check or replace your key."
         self.type_out(msg)
         self._log(msg)
 
